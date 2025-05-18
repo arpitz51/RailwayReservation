@@ -18,8 +18,8 @@ MYSQL *conn;
 // Initialize MySQL connection
 void initializeDatabase() {
     conn = mysql_init(NULL);
-    if (!mysql_real_connect(conn, "localhost", "Username", "Password", 
-                           "TrainDatabaseName", 3306, NULL, 0)) {
+    if (!mysql_real_connect(conn, "localhost", "mysqldb", "Shivam.1257", 
+                           "Train", 3306, NULL, 0)) {
         fprintf(stderr, "Database error: %s\n", mysql_error(conn));
         exit(1);
     }
@@ -143,11 +143,15 @@ typedef struct {
     char date[16];
     char from[64], to[64];
     int passenger_count;
-    Passenger pax[MAX_PASSENGERS];
+    int requested_age_ge_60;
+    int requested_age_lt_60; 
+    Passenger pax[MAX_PASSENGERS]; 
 } BookingArgs;
 
 // Booking thread
 void *processBooking(void *arg) {BookingArgs *ba = (BookingArgs*)arg;
+    printf("\nInside Process booking");
+    fflush(stdout);
     char semName[256], query[MAX_BUFFER], line[MAX_BUFFER];
     sem_t *sems[MAX_PASSENGERS] = {0};
     char *lockedSeats[MAX_PASSENGERS] = {0};
@@ -162,18 +166,49 @@ void *processBooking(void *arg) {BookingArgs *ba = (BookingArgs*)arg;
         "AND start_point='%s' AND destination_point='%s' "
         "AND class_name='%s'",
         ba->train_no, ba->date, ba->from, ba->to, ba->class_name);
-    mysql_query(conn, query);
+    printf("Executing query: %s\n", query);
+        fflush(stdout) ;
+        if (mysql_query(conn, query)) {
+                fprintf(stderr, "ERROR: %s\n", mysql_error(conn));
+            } 
     MYSQL_RES *tres = mysql_store_result(conn);
     MYSQL_ROW Trow = mysql_fetch_row(tres);
     if (Trow && Trow[0]) totalAvail = atoi(Trow[0]);
     mysql_free_result(tres);
 
     int toLock = (ba->passenger_count <= totalAvail) ? ba->passenger_count : totalAvail;
+    // assume you’ve parsed from the client into these two ints:
+    int reqLower = ba->requested_age_ge_60;  // number of seniors
+    int reqUpper = ba->requested_age_lt_60;  // number of others
 
-    // 2) lock semaphores for first toLock seats across coaches
+    // 1) figure out how many lower seats remain overall
+    int totalLower = 0;
+    snprintf(query, sizeof(query),
+        "SELECT SUM(lower_seats) FROM classseats "
+        " WHERE train_number='%s' AND journey_date='%s' "
+        "   AND start_point='%s' AND destination_point='%s' "
+        "   AND class_name='%s';",
+        ba->train_no, ba->date, ba->from, ba->to, ba->class_name);
+    printf("Executing query: %s\n", query);
+        fflush(stdout) ;
+        if (mysql_query(conn, query)) {
+                fprintf(stderr, "ERROR: %s\n", mysql_error(conn));
+            } 
+    {
+    MYSQL_RES *r = mysql_store_result(conn);
+    MYSQL_ROW  row = mysql_fetch_row(r);
+    if (row && row[0]) totalLower = atoi(row[0]);
+    mysql_free_result(r);
+    }
+    int totalUpper = totalAvail - totalLower; 
+    // 3) scan all coaches/columns in seat‐order, but only lock seats that you still “need”:
+    //     - a lower‐berth (col ends in 'L') only if reqLower>0
+    //     - an upper‐berth (col ends in 'U') only if reqUpper>0
+    //     - otherwise skip until your remaining needed seats drop to zero
     for (int coach = 1; coach <= 4 && lockedCount < toLock; ++coach) {
-        snprintf(query, sizeof(query),
-            "SELECT SeatNo1,SeatNo2,SeatNo3,SeatNo4,SeatNo5,"  
+      // fetch the 20 SeatNo columns
+      snprintf(query, sizeof(query),
+          "SELECT SeatNo1,SeatNo2,SeatNo3,SeatNo4,SeatNo5,"  
             "SeatNo6,SeatNo7,SeatNo8,SeatNo9,SeatNo10," 
             "SeatNo11,SeatNo12,SeatNo13,SeatNo14,SeatNo15," 
             "SeatNo16,SeatNo17,SeatNo18,SeatNo19,SeatNo20 "
@@ -183,38 +218,157 @@ void *processBooking(void *arg) {BookingArgs *ba = (BookingArgs*)arg;
             "AND class_name='%s' AND coach_number=%d",
             ba->train_no, ba->date, ba->from, ba->to,
             ba->class_name, coach);
-        mysql_query(conn, query);
-        MYSQL_RES *cres = mysql_store_result(conn);
-        MYSQL_ROW row = mysql_fetch_row(cres);
-        for (int col=0; col<20 && lockedCount<toLock; ++col) {
-            if (row && strcmp(row[col], "X")!=0) {
-                snprintf(semName, sizeof(semName),
-                    "/%s_%s_%s_%s_coach%d_seat%s",
-                    ba->train_no, ba->date, ba->from, ba->class_name,
-                    coach, row[col]);
-                sems[lockedCount] = sem_open(semName, O_CREAT, 0644, 1);
-                if (sems[lockedCount] && sem_trywait(sems[lockedCount])==0) {
-                    snprintf(line, sizeof(line), "%s%d-%s", ba->class_name, coach, row[col]);
-                    lockedSeats[lockedCount] = strdup(line);
-                    lockedCoach[lockedCount] = coach;
-                    lockedCount++;
-                } else if (sems[lockedCount]) {
-                    sem_close(sems[lockedCount]);
-                }
-            }
+      printf("Executing query: %s\n", query);
+      fflush(stdout) ;
+        if (mysql_query(conn, query)) {
+                fprintf(stderr, "ERROR: %s\n", mysql_error(conn));
+            } 
+      MYSQL_RES *cres = mysql_store_result(conn);
+      MYSQL_ROW crow  = mysql_fetch_row(cres);
+      if (!crow) { mysql_free_result(cres); continue; }
+
+      // crow[0]…crow[19] are the seats, crow[20] is lower_seats for this coach
+      for (int col = 0; col < 20 && lockedCount < toLock; ++col) {
+      const char *seat = crow[col];
+      if (strcmp(seat, "X")==0) 
+      continue;  // already booked
+    // 2) decide strategy: if totalLower == 0, fall back to “first‐come” locking
+    //bool enforcePreference = (totalLower > reqLower);
+
+    char last = seat[strlen(seat)-1];  // 'L' or 'U'
+    bool wantThis = false;
+    if(last == 'L' && (reqLower > 0 ) ) {wantThis = true;  reqLower--; totalLower--; }
+    if(last == 'U' && (reqUpper > 0 ) ) {wantThis = true;  reqUpper--; totalUpper--; }
+    if(last == 'U' && (reqLower > 0 && totalLower < reqLower) ) {wantThis = true;  reqLower--; totalUpper--; }
+    if(last == 'L' && (reqUpper > 0 && totalUpper < reqUpper) ) {wantThis = true;  reqUpper--; totalLower--; }
+
+    if (!wantThis) 
+      continue;
+
+    // attempt semaphore
+    snprintf(semName, sizeof(semName),
+      "/%s_%s_%s_%s_coach%d_seat%s",
+      ba->train_no, ba->date, ba->from, ba->class_name,
+      coach, seat);
+    sems[lockedCount] = sem_open(semName, O_CREAT, 0644, 1);
+    if (sems[lockedCount] && sem_trywait(sems[lockedCount])==0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%s%d-%s", ba->class_name, coach, seat);
+        lockedSeats[lockedCount] = strdup(buf);
+        //use strdup in linux and _strdup in windows
+        lockedCoach[lockedCount] = coach;
+        lockedCount++;
+        } else if (sems[lockedCount]) {
+        sem_close(sems[lockedCount]);
         }
-        mysql_free_result(cres);
+    }
+    mysql_free_result(cres);
     }
 
-    // 3) assign seats or waitlist-
-    for (int i=0; i<ba->passenger_count; ++i) {
+    ///////////////Payment 
+    double baseFare = ba->class_fare * ba->passenger_count;
+    double discount = 0;
+    if (ba->passenger_count >= 5)           discount = 0.20;
+    else if (ba->passenger_count >= 3)      discount = 0.10;
+    double payable = baseFare * (1 - discount);
+
+    // 4) Fetch current available seats (sum of available_seats)
+    int avail = 0;
+    snprintf(query, sizeof(query),
+    "SELECT SUM(available_seats) FROM classseats "
+    " WHERE train_number='%s' AND journey_date='%s' "
+    "   AND start_point='%s' AND destination_point='%s' "
+    "   AND class_name='%s';",
+    ba->train_no, ba->date, ba->from, ba->to, ba->class_name);
+    printf("Executing query: %s\n", query);
+        fflush(stdout) ;
+        if (mysql_query(conn, query)) {
+                fprintf(stderr, "ERROR: %s\n", mysql_error(conn));
+            } 
+    {
+    MYSQL_RES *r = mysql_store_result(conn);
+    MYSQL_ROW  row = mysql_fetch_row(r);
+    if (row && row[0]) avail = atoi(row[0]);
+    mysql_free_result(r);
+    }
+
+    // 5) Send payment request
+    char txn[32];
+    snprintf(txn, sizeof(txn), "%ld", time(NULL));
+    
+    char payReq[256];
+    snprintf(payReq,sizeof(payReq),
+      "PAYMENT_REQUEST|%.2f|%d|%s\n", payable, avail, txn);
+    sendResponse(ba->client_sock, payReq);
+
+    snprintf(query, sizeof(query),
+    "SELECT payment_amount, status, sock FROM transaction "
+    "WHERE transaction_id = %s", txn);    
+
+    // 5) Check transaction table
+    bool ok = false;
+    for(int i = 0 ; i < 25 ; i++){
+        sleep(5);
+        if(!mysql_query(conn, query)){
+            printf("Query Executed: %s",query);
+            fflush(stdout);
+        }
+        MYSQL_RES *tres = mysql_store_result(conn);
+        MYSQL_ROW trow = mysql_fetch_row(tres);
+
+        if (trow) {
+            double paid = atof(trow[0]);
+            if (paid == payable && strcmp(trow[1], "SUCCESS")==0) {
+                ok = true;
+                printf("status: %s, sock: %d ",trow[1],atoi(trow[2]));
+                fflush(stdout);
+                ba->client_sock = atoi(trow[2]);
+                break; 
+            }
+            else if (paid == payable && strcmp(trow[1], "FAILED")==0) {
+                ok = false;
+                printf("status: %s, sock: %d ",trow[1],atoi(trow[2]));
+                fflush(stdout);
+                ba->client_sock = atoi(trow[2]);
+                break; 
+            }
+        }
+        mysql_free_result(tres);
+    }
+    if (!ok) {
+        // release any held semaphores before aborting
+        for (int i = 0; i < lockedCount; ++i) {
+            sem_post(sems[i]);
+            sem_close(sems[i]);
+            free(lockedSeats[i]);
+        }
+        sendResponse(ba->client_sock, "TRANSACTION_FAILED|Cancelled");
+        return NULL;
+    }
+
+    ///////////////
+
+    int* arr = malloc(sizeof(int) * lockedCount);
+    int left = 0, right = lockedCount - 1;
+
+    for (int i = 0; i < lockedCount; ++i) {
+        size_t len = strlen(lockedSeats[i]);
+        if (len && lockedSeats[i][len-1] == 'L') {
+            arr[left++] = i;
+        } else {
+            arr[right--] = i;
+        }
+    }
+    free(arr);
+    // Assign seats:
+    for (int i = 0; i < ba->passenger_count; ++i) {
         if (i < lockedCount) {
-            // assign seat_no directly since coach info is already embedded
-            strcpy(ba->pax[i].seat_no, lockedSeats[i]);
+            strcpy(ba->pax[i].seat_no, lockedSeats[arr[i]]);
         } else {
             strcpy(ba->pax[i].seat_no, "WL");
         }
     }
+    int lowerCount[4] = {0};     // only lowers per coach
 
     // 4) update DB: mark locked seats X and adjust counts per coach efficiently
     int count[4] = {0};
@@ -223,23 +377,29 @@ void *processBooking(void *arg) {BookingArgs *ba = (BookingArgs*)arg;
         char temp[64];
         // extract seat number after the dash
         char *dash = strchr(lockedSeats[i], '-');
-        const char *seatNum = dash+1 ;
-        snprintf(temp, sizeof(temp), "SeatNo%s='X'", seatNum);
+        int seatNum = atoi(dash + 1) ;
+        //const char *seatNum = dash+1 ;
+        snprintf(temp, sizeof(temp), "SeatNo%d='X'", seatNum);
         int idx = lockedCoach[i] - 1;
         if (count[idx] > 0) strcat(setClause[idx], ", ");
         strcat(setClause[idx], temp);
         count[idx]++;
+
+        size_t len = strlen(lockedSeats[i]);
+        if (len > 0 && lockedSeats[i][len-1] == 'L') {
+            lowerCount[idx]++;
+        }
     }
 
     for (int i = 0 ; i < 4 ; i++) {
         if (count[i] > 0) {
             snprintf(query, sizeof(query),
                 "UPDATE classseats SET available_seats=available_seats-%d, "
-                "booked_seats=booked_seats+%d,%s "
+                "booked_seats=booked_seats+%d,%s,lower_seats = lower_seats -  %d "
                 "WHERE train_number='%s' AND journey_date='%s' "
                 "AND start_point='%s' AND destination_point='%s' "
                 "AND class_name='%s' AND coach_number=%d",
-                count[i], count[i], setClause[i],
+                count[i], count[i], setClause[i],lowerCount[i],
                 ba->train_no, ba->date, ba->from, ba->to,
                 ba->class_name, i+1);
             mysql_query(conn, query);
@@ -311,9 +471,11 @@ void *processBooking(void *arg) {BookingArgs *ba = (BookingArgs*)arg;
     
     int distance = distTo - distFrom;
     double totalFare = ba->passenger_count * /*fetch per‐ticket fare from classseats if needed*/ ba->class_fare;
-    
+    if(ba->passenger_count >= 5 ) totalFare = totalFare * 0.8 ;
+    else if (ba->passenger_count >= 3 ) totalFare = totalFare * 0.9 ;
+
     // 4) Create entries in reservation & passenger_details
-    char pnr[32], txn[32];
+    char pnr[32];
     snprintf(pnr, sizeof(pnr), "%ld", time(NULL) + 100);
     snprintf(txn, sizeof(txn), "%ld", time(NULL));
 
@@ -388,17 +550,26 @@ void handleBookingRequest(int sock, char *data) {
     strcpy(ba->train_no, strtok(NULL, "|"));
     strcpy(ba->class_name, strtok(NULL, "|"));
     ba->class_fare = atoi(strtok(NULL,"|")) ;
+    ba->requested_age_ge_60 = atoi(strtok(NULL,"|"));
+    ba->requested_age_lt_60 = atoi(strtok(NULL,"|"));
     char *plist = strtok(NULL, "|");
     // Parse passengers
-    char *p = plist ;
+    char *p = plist ;int i = 0;
     while (p && ba->passenger_count < MAX_PASSENGERS) {
-        char *name = strtok(p, ":");
+        char *name;
+        if(i==0) {name = strtok(p, ":");i++;}
+        else name = strtok(NULL,":") ;
+        if(name == NULL) break;
         char *age = strtok(NULL, ";");
         strncpy(ba->pax[ba->passenger_count].name, name, MAX_NAME_LEN);
         ba->pax[ba->passenger_count].age = atoi(age);
+        printf("\nName: %s Age: %d",ba->pax[ba->passenger_count].name,ba->pax[ba->passenger_count].age);
+        fflush(stdout);
         ba->passenger_count++;
-        p = strtok(NULL, ";");
+        //p = strtok(NULL, ";");
     }
+    printf("\nTo Process booking");
+    fflush(stdout);
     pthread_t tid;
     pthread_create(&tid, NULL, processBooking, ba);
     pthread_detach(tid);
@@ -487,7 +658,7 @@ void handleCancel(int sock, char *data) {
     char train_no[32], journey_date[16], start_point[64], destination_point[64], class_name[16];
     snprintf(query, sizeof(query),
         "SELECT train_number, journey_date, start_point, destination_point, class_name "
-        "FROM reservation WHERE pnr_number='%s' ", pnr);
+        "FROM reservation WHERE pnr_number='%s'", pnr);
     mysql_query(conn, query);
     MYSQL_RES *rres = mysql_store_result(conn);
     MYSQL_ROW rrow = mysql_fetch_row(rres);
@@ -496,6 +667,7 @@ void handleCancel(int sock, char *data) {
         sendResponse(sock, "ERROR|No confirmed reservation found");
         return;
     }
+
     strcpy(train_no, rrow[0]);
     strcpy(journey_date, rrow[1]);
     strcpy(start_point, rrow[2]);
@@ -503,7 +675,38 @@ void handleCancel(int sock, char *data) {
     strcpy(class_name, rrow[4]);
     mysql_free_result(rres);
 
-    // 2) Restore seats: for each passenger
+    // 2) Check if cancellation time is before departure
+    snprintf(query, sizeof(query),
+        "SELECT departure_time FROM train_schedule WHERE train_number='%s' AND station_name='%s'",
+        train_no, start_point);
+    mysql_query(conn, query);
+    MYSQL_RES *sres = mysql_store_result(conn);
+    MYSQL_ROW srow = mysql_fetch_row(sres);
+    if (!srow) {
+        mysql_free_result(sres);
+        sendResponse(sock, "ERROR|Schedule info not found");
+        return;
+    }
+
+    // Compare current time with departure time
+    char departure_time[16];
+    strcpy(departure_time, srow[0]);
+    mysql_free_result(sres);
+
+    snprintf(query, sizeof(query),
+        "SELECT NOW() < STR_TO_DATE(CONCAT('%s', ' ', '%s'), '%%Y-%%m-%%d %%H:%%i:%%s')",
+        journey_date, departure_time);
+    mysql_query(conn, query);
+    MYSQL_RES *tres = mysql_store_result(conn);
+    MYSQL_ROW trow = mysql_fetch_row(tres);
+    if (!trow || strcmp(trow[0], "0") == 0) {
+        mysql_free_result(tres);
+        sendResponse(sock, "ERROR|Cannot cancel ticket at or after departure time");
+        return;
+    }
+    mysql_free_result(tres);
+
+    // 3) Restore seats
     snprintf(query, sizeof(query),
         "SELECT seat_number FROM passenger_details WHERE pnr_number='%s' AND seat_number!='WL'", pnr);
     mysql_query(conn, query);
@@ -511,34 +714,49 @@ void handleCancel(int sock, char *data) {
     MYSQL_ROW prow;
     while ((prow = mysql_fetch_row(pres))) {
         char *seat = prow[0];
-        // parse coach and seat index
-        // seat format: CLASS<coach>-<seatNo>
         char *dash = strchr(seat, '-');
         if (!dash) continue;
         int coach = atoi(dash - 1);
         char *seatNo = dash + 1;
-        // mark classseats column X->available
-        // compute column name dynamically
+        int no = atoi(seatNo);
+        size_t len = strlen(dash);
+
         snprintf(query, sizeof(query),
-            "UPDATE classseats SET available_seats=available_seats+1, booked_seats=booked_seats-1, SeatNo%s = '%s' "
+            "UPDATE classseats SET available_seats=available_seats+1, "
+            "booked_seats=booked_seats-1, SeatNo%d='%s', "
+            "lower_seats=lower_seats+%d "
             "WHERE train_number='%s' AND journey_date='%s' "
             "AND start_point='%s' AND destination_point='%s' "
             "AND class_name='%s' AND coach_number=%d",
-            seatNo,seatNo,
+            no, seatNo, dash[len - 1] == 'L' ? 1 : 0,
             train_no, journey_date, start_point, destination_point,
-            class_name,coach );
-        mysql_query(conn, query);
+            class_name, coach);
+        if (mysql_query(conn, query)) {
+            printf("\nExecuted Query: %s", query);
+            fflush(stdout);
+        }
     }
     mysql_free_result(pres);
 
-    // 3) Cancel reservation
+    // 4) Cancel reservation
     snprintf(query, sizeof(query),
-        "UPDATE reservation SET ticket_status='CANCELLED' WHERE pnr_number=%s",pnr);
+        "UPDATE reservation SET ticket_status='CANCELLED' WHERE pnr_number='%s'", pnr);
     if (mysql_query(conn, query) == 0) {
         sendResponse(sock, "CANCELLED|\n");
     } else {
         sendResponse(sock, "ERROR|Cancel failed\n");
     }
+
+    // 5) Fare adjustment logic
+    snprintf(query, sizeof(query),
+        "UPDATE classseats SET ticket_fare1 = base_fare "
+        "WHERE train_number='%s' AND journey_date='%s' "
+        "AND start_point='%s' AND destination_point='%s' "
+        "AND class_name='%s' "
+        "AND ticket_fare1 != base_fare "
+        "AND (booked_seats * 100) < 80 * (booked_seats + available_seats)",
+        train_no, journey_date, start_point, destination_point, class_name);
+    mysql_query(conn, query);
 }
 
 void handleSeatMap(int sock, char *data) {
@@ -589,7 +807,27 @@ void handleSeatMap(int sock, char *data) {
     // send once
     send(sock, fullResp, offset, 0);
 }
-
+void handlePayment(int sock, char *data) {
+    // data == "<amount>|<txn_id>|<status>"
+    char *amtStr  = strtok(data, "|");
+    char *txnStr  = strtok(NULL, "|");
+    char *statStr = strtok(NULL, "|");
+    if (!amtStr||!txnStr||!statStr) {
+        sendResponse(sock, "ERROR|Malformed PAYMENT\n");
+        return;
+    }
+    // Insert into transaction table
+    char query[MAX_BUFFER];
+    snprintf(query, sizeof(query),
+      "INSERT INTO transaction (transaction_id, payment_amount, status, sock) "
+      "VALUES (%s, %s, '%s', %d)",
+      txnStr, amtStr, statStr, sock);
+      printf("Query: %s",query);
+      fflush(stdout); 
+    if (mysql_query(conn, query)) {
+        sendResponse(sock, "ERROR|DB\n");
+    }
+}
 // Handler: LIST_TRAINS|journey_date|from_station|to_station
 void handleListTrains(int sock, char *data) {
     char *date = strtok(data, "|");
@@ -660,6 +898,7 @@ void *clientHandler(void *arg) {
         else if (strcmp(action, "SHOW_TICKETS")==0) handleShowTickets(sock, data);
         else if (strcmp(action, "CANCEL")==0) handleCancel(sock, data);
         else if (strcmp(action, "GET_SEATMAP")==0) handleSeatMap(sock,data);
+        else if (strcmp(action, "PAYMENT")==0) handlePayment(sock,data);
         else sendResponse(sock, "ERROR|Invalid action\n");
     }
     close(sock);
@@ -674,8 +913,10 @@ int main() {
     if (server_sock < 0) {perror("[-]Socket error");exit(1);}
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = PORT;
-    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    server_addr.sin_port = htons(PORT);
+    // server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    server_addr.sin_addr.s_addr = INADDR_ANY; 
+    //inet_pton(AF_INET, "192.168.29.125", &server_addr.sin_addr);
     if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr))) {
         perror("[-]Bind error");exit(1);}
     listen(server_sock, 20);
