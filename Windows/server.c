@@ -9,7 +9,7 @@
 #include <WinSock2.h>
 #include <ws2tcpip.h>
 #include <mysql.h>
-#include <synchapi.h>
+
 #pragma comment(lib, "ws2_32.lib")
 #define MAX_BUFFER 8192
 #define PORT 5566
@@ -243,30 +243,74 @@ void* processBooking(void* arg) {
 
             char last = seat[strlen(seat) - 1];  // 'L' or 'U'
             bool wantThis = false;
+
+
             if (last == 'L' && (reqLower > 0)) { wantThis = true;  reqLower--; totalLower--; }
             if (last == 'U' && (reqUpper > 0)) { wantThis = true;  reqUpper--; totalUpper--; }
             if (last == 'U' && (reqLower > 0 && totalLower < reqLower)) { wantThis = true;  reqLower--; totalUpper--; }
             if (last == 'L' && (reqUpper > 0 && totalUpper < reqUpper)) { wantThis = true;  reqUpper--; totalLower--; }
 
+            //Three cases 1) reqLower>0 and reqUpper>0 all Seniors get L seats and below 60 gets U seats
+            //            2) reqLower>0 and reqUpper=0 all seniors get L seats if available else some or all get U seats 
+            //            3) reqLower=0 and reqUpper>0 all below 60 get U seats if available else some (if 0<totalUpper<reqUpper) or all get L seats (totalUpper = 0)
+
+
             if (!wantThis)
                 continue;
 
             // attempt semaphore
+            //snprintf(semName, sizeof(semName),
+            //    "/%s_%s_%s_%s_coach%d_seat%s",
+            //    ba->train_no, ba->date, ba->from, ba->class_name,
+            //    coach, seat);
+            //sems[lockedCount] = sem_open(semName, O_CREAT, 0644, 1);
+            //printf("\nsemName %s    Sem[%d] = %u ", semName, lockedCount, sems[lockedCount]);
+            //if (sems[lockedCount] == SEM_FAILED) {
+            //    perror("sem_open failed"); // skip this seat
+            //}
+            //fflush(stdout);
+            //if (sems[lockedCount] && sem_trywait(sems[lockedCount]) == 0) {
+            //    char buf[32];
+            //    snprintf(buf, sizeof(buf), "%s%d-%s", ba->class_name, coach, seat);
+            //    lockedSeats[lockedCount] = _strdup(buf);
+            //    //use strdup in linux and _strdup in windows
+            //    lockedCoach[lockedCount] = coach;
+            //    lockedCount++;
+            //}
+            //else if (sems[lockedCount]) {
+            //    sem_close(sems[lockedCount]);
+            //}
+            char semName[128];
             snprintf(semName, sizeof(semName),
-                "/%s_%s_%s_%s_coach%d_seat%s",
+                "%s_%s_%s_%s_coach%d_seat%s",
                 ba->train_no, ba->date, ba->from, ba->class_name,
                 coach, seat);
-            sems[lockedCount] = sem_open(semName, O_CREAT, 0644, 1);
-            if (sems[lockedCount] && sem_trywait(sems[lockedCount]) == 0) {
+
+            // Create or open named semaphore with initial count = 1, max count = 1
+            HANDLE hSem = CreateSemaphoreA(
+                NULL,       // default security
+                1,          // initial count
+                1,          // max count
+                semName     // name
+            );
+
+            if (!hSem) {
+                fprintf(stderr, "CreateSemaphoreA failed for %s\n", semName);
+                continue;
+            }
+
+            // Try to acquire the semaphore immediately
+            DWORD waitRes = WaitForSingleObject(hSem, 0); // 0 ms timeout
+            if (waitRes == WAIT_OBJECT_0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "%s%d-%s", ba->class_name, coach, seat);
-                lockedSeats[lockedCount] = _strdup(buf);
-                //use strdup in linux and _strdup in windows
+                lockedSeats[lockedCount] = _strdup(buf);  // strdup for Windows
                 lockedCoach[lockedCount] = coach;
+                sems[lockedCount] = hSem;
                 lockedCount++;
             }
-            else if (sems[lockedCount]) {
-                sem_close(sems[lockedCount]);
+            else {
+                CloseHandle(hSem); // could not acquire, cleanup
             }
         }
         mysql_free_result(cres);
@@ -291,7 +335,7 @@ void* processBooking(void* arg) {
     fflush(stdout);
     if (mysql_query(conn, query)) {
         fprintf(stderr, "ERROR: %s\n", mysql_error(conn));
-    }
+    }     
     {
         MYSQL_RES* r = mysql_store_result(conn);
         MYSQL_ROW  row = mysql_fetch_row(r);
@@ -344,10 +388,21 @@ void* processBooking(void* arg) {
     }
     if (!ok) {
         // release any held semaphores before aborting
-        for (int i = 0; i < lockedCount; ++i) {
+        /*for (int i = 0; i < lockedCount; ++i) {
             sem_post(sems[i]);
             sem_close(sems[i]);
             free(lockedSeats[i]);
+        }*/
+        for (int i = 0; i < lockedCount; ++i) {
+            if (sems[i]) {
+                ReleaseSemaphore(sems[i], 1, NULL); // release lock
+                CloseHandle(sems[i]);               // close handle
+                sems[i] = NULL;
+            }
+            if (lockedSeats[i]) {
+                free(lockedSeats[i]);
+                lockedSeats[i] = NULL;
+            }
         }
         sendResponse(ba->client_sock, "TRANSACTION_FAILED|Cancelled");
         return NULL;
@@ -367,7 +422,6 @@ void* processBooking(void* arg) {
             arr[right--] = i;
         }
     }
-    free(arr);
     // Assign seats:
     for (int i = 0; i < ba->passenger_count; ++i) {
         if (i < lockedCount) {
@@ -377,6 +431,7 @@ void* processBooking(void* arg) {
             strcpy(ba->pax[i].seat_no, "WL");
         }
     }
+    free(arr);
     int lowerCount[4] = { 0 };     // only lowers per coach
 
     // 4) update DB: mark locked seats X and adjust counts per coach efficiently
@@ -416,7 +471,7 @@ void* processBooking(void* arg) {
     }
 
     // Dynamic fare surge: one-time 20% hike when crossing 80% occupancy
-    snprintf(query, sizeof(query),
+    snprintf(query, sizeof(query), 
         "UPDATE classseats SET ticket_fare1 = ROUND(base_fare * 1.2, 2) "
         "WHERE train_number='%s' AND journey_date='%s' "
         "AND start_point='%s' AND destination_point='%s' "
@@ -429,9 +484,15 @@ void* processBooking(void* arg) {
 
     // 5) release all locks
     for (int i = 0; i < lockedCount; ++i) {
-        sem_post(sems[i]);
-        sem_close(sems[i]);
-        free(lockedSeats[i]);
+        if (sems[i]) {
+            ReleaseSemaphore(sems[i], 1, NULL); // release lock
+            CloseHandle(sems[i]);               // close handle
+            sems[i] = NULL;
+        }
+        if (lockedSeats[i]) {
+            free(lockedSeats[i]);
+            lockedSeats[i] = NULL;
+        }
     }
 
     // 6) proceed with reservation insert & response
